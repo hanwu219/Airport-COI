@@ -1,6 +1,6 @@
 # main.py 使用说明
 
-本文档对应当前 [main.py](d:/construction-operation/code/main.py) 实现。
+本文档对应当前 [main.py] 实现。
 
 ## 1. 功能概览
 
