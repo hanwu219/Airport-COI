@@ -1,42 +1,32 @@
-# main.py 使用说明
+# Construction-Operation Coordination Graph Pipeline
 
-本文档对应当前 [main.py] 实现。
+This repository contains scripts for constructing a task-requirement heterogeneous graph, enriching tabular project data with LLM-generated structured fields, training a relation-aware graph attention model, and exporting ranking/community analysis results.
 
-## 1. 功能概览
+## Script Overview
 
-`main.py` 用于建设任务 T 与运营需求 O 的异质图匹配和软社区识别。完整流程如下：
+- `llm_write.py`: Uses the DeepSeek-compatible OpenAI API to enrich airport operation requirement records. It reads an Excel file, generates structured fields such as `system`, `space`, `jobs_to_be_done`, `moscow`, `need_text`, and `target_s1`-`target_s4`, then exports a CSV file.
+- `llm_write_c.py`: Uses the same API pattern to enrich construction task records. It reads an Excel file, generates `space`, `task_text`, and one-hot stage fields `target_s1`-`target_s4`, then exports a CSV file.
+- `main.py`: Trains the heterogeneous graph attention model for construction task and operation requirement matching. It builds T/O node features, TT/TO/OT edges, trains with supervised TO labels, performs an 80/20 held-out label split by default, and exports Top-k ranking and soft-community results.
 
-1. 读取并校验 4 张 CSV：`t.csv`、`o.csv`、`tt_edges.csv`、`to_labels.csv`
-2. 将 `to_labels.csv` 默认按 8:2 切分为训练标签和测试标签
-3. 构造 T/O 节点特征
-4. 构造 `TT`、`TO`、`OT` 三类边及其边特征、mask
-5. 使用关系感知、边感知、多头 GAT 编码
-6. 训练阶段只使用训练标签计算 `L_edge`
-7. 导出 Top-k 排序、节点社区概率、训练日志、checkpoint
-8. 使用测试标签计算 held-out Top-k、MRR、Recall 指标
+API credentials are read from environment variables. Do not commit `.env` files, raw project data, model checkpoints, or generated output folders to a public repository.
 
-当前版本关键点：
+## Installation
 
-- 输入是四表，不使用 JSON 列。
-- `to_labels` 默认按 `o_id` 分组 8:2 切分。
-- 测试标签不进入监督训练，只用于导出后的测试集排序评估。
-- `L_st` 中时间门控使用 `s_stage`。
-- 社区头为 softmax。
-- 支持候选边 quantile 过滤、warmup+cosine 学习率、防塌缩正则、按名称禁用 loss。
-
-## 2. 依赖
-
-推荐 Python 3.10+。
+Python 3.10+ is recommended.
 
 ```bash
-pip install -U torch torch-geometric pandas numpy scikit-learn sentence-transformers
+pip install -r requirements.txt
 ```
 
-## 3. 输入数据
+The project depends on PyTorch and PyTorch Geometric. For GPU-specific environments, install the versions of `torch` and `torch-geometric` that match your CUDA setup before running the pipeline.
 
-### 3.1 T 节点表
+## Input Data
 
-必填列：
+`main.py` expects four CSV files.
+
+### Task Table
+
+Required columns:
 
 - `t_id`
 - `task_text`
@@ -45,15 +35,15 @@ pip install -U torch torch-geometric pandas numpy scikit-learn sentence-transfor
 - `space_path`
 - `start_date`, `end_date`
 
-约束：
+Constraints:
 
-- `t_id` 唯一。
-- 阶段列可转数值。
-- 日期可解析，且 `end_date >= start_date`。
+- `t_id` must be unique.
+- Stage columns must be numeric.
+- Dates must be parseable, and `end_date >= start_date`.
 
-### 3.2 O 节点表
+### Operation Requirement Table
 
-必填列：
+Required columns:
 
 - `o_id`
 - `need_text`
@@ -63,99 +53,150 @@ pip install -U torch torch-geometric pandas numpy scikit-learn sentence-transfor
 - `stakeholder`
 - `priority`
 
-`priority` 支持数值 `[0,1]`，也支持 `Must/Should/Could/Wont`，其他值回退为 `0.5`。
+`priority` may be numeric in `[0, 1]` or one of `Must`, `Should`, `Could`, `Wont`. Unknown values fall back to `0.5`.
 
-### 3.3 TT 边表
+### TT Edge Table
 
-必填列：
+Required columns:
 
 - `t_id`
 - `pred_t_id`
 - `lag_days`
 
-说明：
+The edge direction is `pred_t_id -> t_id`. Rows containing unknown task IDs are ignored with a warning.
 
-- `lag_days` 必须可转数值。
-- `t_id/pred_t_id` 不存在于 T 表的行会被忽略并告警。
-- 当前逻辑关系固定为 `FS`，方向为 `pred_t -> t`。
+### TO Label Table
 
-### 3.4 TO 监督标签表
-
-必填列：
+Required columns:
 
 - `o_id`
 - `t_id`
 - `label`
 
-可选列：
+Optional column:
 
-- `weight`，缺省自动补 `1.0`
+- `weight`
 
-约束与切分：
+Rules:
 
-- `label >= 0.5` 视为正样本，否则视为负样本。
-- `o_id/t_id` 不存在的行会被忽略并告警。
-- 默认 `--label-test-ratio 0.2`，即 80% 标签用于训练，20% 标签用于测试。
-- 默认 `--label-split-mode o_id`，同一个 O 的所有标签只进入训练或测试一侧。
-- 可选 `--label-split-mode row` 按标签行随机切分，但论文测试更建议使用默认的 `o_id` 分组切分。
+- `label >= 0.5` is treated as a positive TO label.
+- Missing `weight` values are replaced with `1.0`.
+- Rows containing unknown `o_id` or `t_id` are ignored with a warning.
 
-## 4. 特征与候选边
+By default, TO labels are split into training and test subsets using `--label-test-ratio 0.2` and `--label-split-mode o_id`. This keeps all labels for the same operation requirement on one side of the split. The training subset is used for `L_edge`; the test subset is used only for held-out ranking evaluation.
 
-T 节点特征：
+## LLM Enrichment Scripts
 
-`x_t = [v_text || v_stage(4) || v_system || v_space || v_time(3)]`
+Both LLM scripts use `AsyncOpenAI` with a DeepSeek-compatible endpoint.
 
-O 节点特征：
+Set credentials in the environment or in a local `.env` file:
 
-`x_o = [v_text || v_target_stage(4) || v_system || v_space_hint || v_stakeholder || v_priority(1)]`
+```text
+DEEPSEEK_API_KEY=your_api_key_here
+DEEPSEEK_BASE_URL=https://api.deepseek.com
+```
 
-TO 候选边特征：
+The default model is `deepseek-v4-flash`.
 
-`e_TO = [s_sem, s_stage, s_system, s_space, s_priority]`
+Run operation requirement enrichment:
 
-预评分：
+```powershell
+python llm_write.py `
+  --input-xlsx ".\data\operation_requirements.xlsx" `
+  --output-csv ".\data\operation_requirements_enriched.csv"
+```
 
-`pre_score = 0.40*s_sem + 0.20*s_stage + 0.15*s_system + 0.15*s_space + 0.10*s_priority`
+Run construction task enrichment:
 
-每个 O 的 TO 候选边先做 hard invalid 过滤，再按 `--to-pre-score-quantile` 与 `--to-pre-score-floor` 筛选，并受 `--min-to-edges-per-o`、`--max-to-edges-per-o` 控制。
+```powershell
+python llm_write_c.py `
+  --input-xlsx ".\data\construction_tasks.xlsx" `
+  --output-csv ".\data\construction_tasks_enriched.csv"
+```
 
-## 5. 模型与损失
+The scripts include conservative retry and timeout handling. Generated text should be reviewed before being used as research or engineering data.
 
-模型结构：
+## Graph Model Pipeline
 
-- T/O 类型投影 MLP
-- 多层关系感知、边感知、多头注意力
-- Residual + LayerNorm
-- 社区头：`S = softmax(cluster_logits / cluster_temp)`
-- 边评分头：`MLP([h_t || h_o || h_t*h_o || e_to])`
+`main.py` builds the heterogeneous graph and trains a relation-aware, edge-aware GAT model.
 
-总损失：
+Node features:
 
-`L = alpha*L_recTT + beta*L_edge + gamma*L_clus + delta*L_st + lambda_type_dominance*L_type_dominance + lambda_balance*L_balance + lambda_collapse*L_collapse`
+- Task nodes: `task_text`, stage vector, system embedding, space embedding, and normalized timing features.
+- Operation nodes: `need_text`, target stage vector, system embedding, space embedding, stakeholder embedding, and priority.
 
-分项说明：
+Edge types:
 
-- `L_recTT`：TT 边重构 BCE，含负采样。
-- `L_edge`：训练标签中的 T-O BCE，含样本权重。
-- `L_clus`：模块度项 + 正交约束。
-- `L_st`：语义、空间、阶段一致性约束。
-- `L_type_dominance`：避免簇被单一节点类型主导。
-- `L_balance`：簇使用均衡。
-- `L_collapse`：最大簇占比防塌缩。
+- `TT`: task precedence edges.
+- `TO`: task-to-operation candidate edges.
+- `OT`: reverse operation-to-task candidate edges.
 
-## 6. 主要 CLI 参数
+TO candidate edge features:
 
-基础参数：
+```text
+[s_sem, s_stage, s_system, s_space, s_priority]
+```
+
+Candidate pre-score:
+
+```text
+0.40*s_sem + 0.20*s_stage + 0.15*s_system + 0.15*s_space + 0.10*s_priority
+```
+
+The model optimizes:
+
+```text
+L = alpha*L_recTT
+  + beta*L_edge
+  + gamma*L_clus
+  + delta*L_st
+  + lambda_type_dominance*L_type_dominance
+  + lambda_balance*L_balance
+  + lambda_collapse*L_collapse
+```
+
+where `L_edge` uses only the training split of TO labels.
+
+## Running main.py
+
+Example:
+
+```powershell
+python main.py `
+  --t-csv ".\data\tasks.csv" `
+  --o-csv ".\data\operation_requirements.csv" `
+  --tt-edges-csv ".\data\tt_edges.csv" `
+  --to-labels-csv ".\data\to_labels.csv" `
+  --text-model sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2 `
+  --label-test-ratio 0.2 `
+  --label-split-mode o_id `
+  --eval-ks 1,3,5,10
+```
+
+Smoke test:
+
+```powershell
+python main.py `
+  --t-csv ".\data\tasks.csv" `
+  --o-csv ".\data\operation_requirements.csv" `
+  --tt-edges-csv ".\data\tt_edges.csv" `
+  --to-labels-csv ".\data\to_labels.csv" `
+  --text-model sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2 `
+  --smoke-epochs 5
+```
+
+## Key Parameters
+
+Training:
 
 - `--epochs 200`
 - `--patience 20`
 - `--lr 1e-3`
 - `--weight-decay 1e-4`
 - `--device auto`
-- `--topk 10`
 - `--seed 42`
 
-模型结构：
+Model:
 
 - `--hidden-dim 128`
 - `--heads 4`
@@ -166,7 +207,7 @@ TO 候选边特征：
 - `--cluster-temp-min 0.8`
 - `--cluster-temp-anneal none`
 
-损失权重：
+Loss weights:
 
 - `--alpha 0.8`
 - `--beta 2.0`
@@ -179,13 +220,7 @@ TO 候选边特征：
 - `--max-cluster-share 0.35`
 - `--tau-sem 0.2`
 
-可按名称关闭 loss：
-
-```powershell
---disable-losses rec,edge,clus,st,type_dominance,balance,collapse
-```
-
-候选边与采样：
+Candidate generation and sampling:
 
 - `--min-to-edges-per-o 20`
 - `--max-to-edges-per-o 120`
@@ -193,100 +228,34 @@ TO 候选边特征：
 - `--to-pre-score-floor 0.0`
 - `--hard-neg-ratio 4`
 - `--tt-neg-ratio 1.0`
-- `--stage-hard-th 0.15`
-- `--system-hard-th 0.10`
-- `--sem-hard-th 0.10`
-- `--old-task-days 180`
-- `--max-lag-days-mask 365`
 
-训练稳定项：
-
-- `--warmup-epochs 10`
-- `--min-lr-scale 0.1`
-- `--grad-clip 5.0`
-
-监督标签切分与测试评估：
+Held-out evaluation:
 
 - `--label-test-ratio 0.2`
 - `--label-split-mode o_id`
 - `--eval-ks 1,3,5,10`
 
-说明：
+## Outputs
 
-- `--eval-ks` 中大于 `--topk` 的值会被忽略。
-- 论文中的无泄漏排序指标应使用测试划分结果，即 `outputs/test_topk_eval_by_k.csv` 或 `train_metrics.json` 中的 `test_topk_*` 字段。
+Default output directory: `outputs/`  
+Default checkpoint directory: `checkpoints/`
 
-## 7. 运行命令
+Generated files:
 
-PowerShell 单行：
+- `outputs/o_to_topk.csv`: Top-k task ranking for each operation requirement.
+- `outputs/node_clusters.csv`: Hard cluster assignment and soft cluster probabilities.
+- `outputs/to_labels_train.csv`: TO labels used for supervised training.
+- `outputs/to_labels_test.csv`: Held-out TO labels used for test evaluation.
+- `outputs/test_topk_eval_by_k.csv`: Held-out Hit@k, macro Recall@k, and micro Recall@k.
+- `outputs/test_per_o_eval.csv`: Per-requirement first-hit rank, MRR, Hit@k, and Recall@k.
+- `outputs/train_metrics.json`: Training history, label split statistics, and held-out test summary.
+- `checkpoints/gat_best.pt`: Best model checkpoint by training loss.
 
-```powershell
-python main.py --t-csv "D:\construction-operation\construction\new_task.csv" --o-csv "D:\construction-operation\requirement\new_operation.csv" --tt-edges-csv "D:\construction-operation\construction\ttedges.csv" --to-labels-csv "D:\construction-operation\requirement\tolabels.csv" --text-model sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
-```
+The held-out ranking metrics should be taken from `outputs/test_topk_eval_by_k.csv` or the `test_topk_*` fields in `train_metrics.json`.
 
-PowerShell 多行：
+## Using analysis.py
 
-```powershell
-python main.py `
-  --t-csv "D:\construction-operation\construction\new_task.csv" `
-  --o-csv "D:\construction-operation\requirement\new_operation.csv" `
-  --tt-edges-csv "D:\construction-operation\construction\ttedges.csv" `
-  --to-labels-csv "D:\construction-operation\requirement\tolabels.csv" `
-  --text-model sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2 `
-  --label-test-ratio 0.2 `
-  --label-split-mode o_id `
-  --eval-ks 1,3,5,10
-```
-
-快速烟雾测试：
-
-```powershell
-python main.py --t-csv ".\data\t.csv" --o-csv ".\data\o.csv" --tt-edges-csv ".\data\tt_edges.csv" --to-labels-csv ".\data\to_labels.csv" --text-model sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2 --smoke-epochs 5
-```
-
-## 8. 输出文件
-
-默认输出目录：`outputs/`，模型目录：`checkpoints/`。
-
-- `outputs/o_to_topk.csv`：所有 O 的 Top-k T 排序结果。
-- `outputs/node_clusters.csv`：节点硬簇和软社区概率。
-- `outputs/to_labels_train.csv`：训练划分标签，参与 `L_edge`。
-- `outputs/to_labels_test.csv`：测试划分标签，仅用于 held-out 评价。
-- `outputs/test_topk_eval_by_k.csv`：测试集 `Hit@k`、macro Recall、micro Recall。
-- `outputs/test_per_o_eval.csv`：测试集中每个含正样本 O 的首命中排名、MRR、Hit@k、Recall@k。
-- `outputs/train_metrics.json`：训练日志、标签切分统计、测试集 Top-k 汇总。
-- `checkpoints/gat_best.pt`：最佳训练损失对应的模型权重。
-
-`train_metrics.json` 顶层包含：
-
-- `best_epoch`
-- `best_loss`
-- `epochs_ran`
-- `loss_coefficients`
-- `cluster_config`
-- `label_split`
-- `test_topk_summary`
-- `test_topk_by_k`
-- `history`
-
-`history` 每轮包含：
-
-- `loss_total`
-- `loss_rec_tt`
-- `loss_edge`
-- `loss_clus`
-- `loss_st`
-- `loss_type_dominance`
-- `loss_balance`
-- `loss_collapse`
-- `sup_edges`
-- `lr`
-- `cluster_temp`
-- `epoch`
-
-## 9. 与 analysis.py 的关系
-
-`analysis.py` 仍可用于生成更完整的分析表、社区成员表和图导出。修改后应注意标签文件选择：
+If a separate analysis script is used, pass the held-out test labels rather than the original full label table:
 
 ```powershell
 python analysis.py `
@@ -296,26 +265,19 @@ python analysis.py `
   --ks 1,3,5,10
 ```
 
-若把原始完整 `tolabels.csv` 传给 `analysis.py`，得到的是包含训练标签的总体评价，不应作为无泄漏测试指标写入论文。
+Using the original full `to_labels.csv` for evaluation includes training labels and should not be reported as leakage-free test performance.
 
-## 10. 常见问题
+## Public Repository Hygiene
 
-1. `unrecognized arguments: \ \ \`
+Before publishing this repository, exclude:
 
-PowerShell 续行符应使用反引号 `` ` ``，也可以直接使用单行命令。
+- `.env`
+- raw `.xlsx` and `.csv` project data
+- `outputs/`
+- `checkpoints/`
+- `analysis_outputs/`
+- `benchmark_outputs/`
+- `__pycache__/`
+- model checkpoint files such as `*.pt`
 
-2. `missing required columns`
-
-检查四张 CSV 的列名是否严格一致。
-
-3. 边表 unknown ID 警告
-
-边引用了不存在的节点 ID，该行会被忽略。
-
-4. 测试集指标比原论文表格低
-
-这是正常现象。现在测试标签没有参与训练，指标是 held-out evaluation，不再是完整标签集上的 in-sample evaluation。
-
-5. 测试集中正样本过少
-
-优先保持默认 `--label-split-mode o_id`，并检查原始 `to_labels.csv` 中每个 O 的正负样本分布。若只做工程调试，可临时使用 `--label-split-mode row`。
+This repository is provided for review and reference purposes only. No license is granted for reuse, redistribution, or derivative works.
