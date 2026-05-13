@@ -283,25 +283,6 @@ The default output directory is `outputs/`.
 - `test_topk_by_k`
 - `history`
 
-## Held-Out Evaluation
-
-Reports and papers should use the held-out test outputs for ranking metrics:
-
-- `outputs/test_topk_eval_by_k.csv`
-- `outputs/test_per_o_eval.csv`
-- `train_metrics.json` fields `test_topk_summary` and `test_topk_by_k`
-
-If `analysis.py` is used for additional reporting, pass the test label file rather than the original full label file:
-
-```bash
-python analysis.py \
-  --outputs-dir outputs \
-  --to-labels-csv outputs/to_labels_test.csv \
-  --out-dir analysis_outputs \
-  --ks 1,3,5,10
-```
-
-Passing the original full `to_labels.csv` to `analysis.py` includes training labels in evaluation and should not be reported as leakage-free test performance.
 
 ## Notes for Public Repositories
 
