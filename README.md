@@ -284,22 +284,4 @@ The default output directory is `outputs/`.
 - `history`
 
 
-## Troubleshooting
-
-PowerShell line-continuation errors:
-
-- Use backticks in PowerShell, or run the command on a single line.
-
-Missing required columns:
-
-- Check the exact CSV column names listed above.
-
-Unknown IDs in edge or label files:
-
-- Rows with unknown node IDs are ignored with warnings.
-
-Held-out metrics are lower than previous full-label metrics:
-
-- This is expected. Test labels no longer participate in supervised edge training.
-
 This repository is provided for review and reference purposes only. No license is granted for reuse, redistribution, or derivative works.
