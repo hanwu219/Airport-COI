@@ -284,22 +284,6 @@ The default output directory is `outputs/`.
 - `history`
 
 
-## Notes for Public Repositories
-
-Do not commit private data, generated outputs, checkpoints, or environment files. Recommended ignore patterns include:
-
-```gitignore
-.env
-*.xlsx
-*.csv
-outputs/
-checkpoints/
-analysis_outputs/
-benchmark_outputs/
-__pycache__/
-*.pt
-```
-
 ## Troubleshooting
 
 PowerShell line-continuation errors:
