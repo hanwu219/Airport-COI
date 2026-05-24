@@ -1,6 +1,6 @@
 # Spatiotemporal-Semantic Relational HGNN
 
-This repository contains an implementation of a spatio-semantic relational graph attention network for matching construction tasks (`T`) with operation requirements (`O`) and identifying soft coordination communities.
+This repository contains an implementation of a spatiotemporal-semantic relational graph attention network for matching construction tasks (`T`) with operation requirements (`O`) and identifying soft coordination communities.
 
 The main execution script is [main.py](main.py).
 
@@ -8,7 +8,7 @@ The main execution script is [main.py](main.py).
 
 `main.py` implements the following workflow:
 
-1. Load and validate four input CSV files: task nodes, requirement nodes, task-task edges, and task-requirement labels.
+1. Load and validate four input CSV files: task nodes, requirement nodes, task-task edges, and to labels.
 2. Split `to_labels.csv` into training and test labels. The default split ratio is 8:2.
 3. Construct T/O node features from text, stage, system, space, schedule, stakeholder, and priority attributes.
 4. Construct `TT`, `TO`, and `OT` relation edges with edge attributes and masks.
@@ -78,7 +78,7 @@ Required columns:
 
 The edge direction is `pred_t_id -> t_id`. Rows that reference unknown task IDs are ignored with a warning.
 
-### Task-Operation Label CSV
+### T-O Label CSV
 
 Required columns:
 
@@ -269,7 +269,7 @@ The default output directory is `outputs/`.
 - `test_topk_eval_by_k.csv`: held-out `Hit@k`, macro Recall, and micro Recall.
 - `test_per_o_eval.csv`: per-requirement first-hit rank, MRR, `Hit@k`, and `Recall@k`.
 - `train_metrics.json`: loss history, label-split summary, and held-out test summary.
-- `checkpoints/gat_best.pt`: best model checkpoint selected by training loss.
+- `checkpoints/model_best.pt`: best model checkpoint selected by training loss.
 
 `train_metrics.json` includes:
 
