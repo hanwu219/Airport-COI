@@ -1,4 +1,4 @@
-# Spatiotemporal-Semantic Relational HGN
+# Spatiotemporal-Semantic Relational HGNN
 
 This repository contains an implementation of a spatio-semantic relational graph attention network for matching construction tasks (`T`) with operation requirements (`O`) and identifying soft coordination communities.
 
