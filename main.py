@@ -8,6 +8,7 @@ import copy
 import json
 import random
 import re
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -65,7 +66,7 @@ EPS = 1e-9
 
 
 @dataclass
-class BuildArtifacts:
+class ProjectGraph:
     x_t: torch.Tensor
     x_o: torch.Tensor
     t_df: pd.DataFrame
@@ -84,6 +85,14 @@ class BuildArtifacts:
     to_sem_score: torch.Tensor
     to_stage_score: torch.Tensor
     to_space_score: torch.Tensor
+    cluster_B: torch.Tensor
+    cluster_m2: float
+    to_edge_by_o: dict[int, list[int]]
+    pair_features: np.ndarray
+
+
+@dataclass
+class BuildArtifacts(ProjectGraph):
     labeled_t_global: torch.Tensor
     labeled_o_global: torch.Tensor
     labeled_edge_attr: torch.Tensor
@@ -93,9 +102,6 @@ class BuildArtifacts:
     unlabeled_o_global: torch.Tensor
     unlabeled_edge_attr: torch.Tensor
     unlabeled_sem: torch.Tensor
-    cluster_B: torch.Tensor
-    cluster_m2: float
-    to_edge_by_o: dict[int, list[int]]
     labeled_neg_by_o: dict[int, list[int]]
     unlabeled_by_o: dict[int, list[int]]
 
@@ -107,8 +113,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tt-edges-csv", required=True, help="Path to TT edge table csv")
     parser.add_argument("--to-labels-csv", required=True, help="Path to TO supervised labels csv")
     parser.add_argument("--text-model", required=True, help="SentenceTransformer model name/path")
-    parser.add_argument("--out-dir", default="outputs", help="Output folder")
-    parser.add_argument("--ckpt-dir", default="checkpoints", help="Checkpoint folder")
+    parser.add_argument("--out-dir", default="outputs_cv5", help="Parent directory for cross-validation runs")
+    parser.add_argument("--ckpt-dir", default="checkpoints_cv5", help="Parent directory for fold checkpoints")
     parser.add_argument("--epochs", type=int, default=200)
     parser.add_argument("--patience", type=int, default=20)
     parser.add_argument("--lr", type=float, default=1e-3)
@@ -119,11 +125,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dropout", type=float, default=0.2)
     parser.add_argument("--k", type=int, default=8, help="Community count")
     parser.add_argument("--topk", type=int, default=10, help="Top-k T per O in inference export")
-    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--train-seed", "--seed", dest="seed", type=int, default=42, help="Training seed reset before fitting each fold")
     parser.add_argument("--batch-size-embed", type=int, default=64)
     parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"])
-    parser.add_argument("--label-test-ratio", type=float, default=0.2, help="Hold out this ratio of TO labels for test evaluation")
-    parser.add_argument("--label-split-mode", default="o_id", choices=["o_id", "row"], help="Split TO labels by o_id group or by individual rows")
+    parser.add_argument("--split-seed", type=int, default=42, help="Seed for the five requirement folds, independent of training")
+    parser.add_argument("--label-test-ratio", type=float, choices=[0.2], default=0.2,
+                        help="Compatibility with single-split commands; five folds imply a 0.2 holdout fraction")
+    parser.add_argument("--label-split-mode", choices=["o_id"], default="o_id",
+                        help="All labels for a requirement must stay in the same fold")
     parser.add_argument("--eval-ks", default="1,3,5,10", help="Comma-separated K values for held-out Top-k evaluation")
     parser.add_argument("--alpha", type=float, default=0.8)
     parser.add_argument("--beta", type=float, default=2.0)
@@ -384,77 +393,27 @@ def label_split_stats(df: pd.DataFrame, prefix: str) -> dict[str, int]:
     }
 
 
-def _sample_holdout_values(values: list[str], ratio: float, rng: np.random.Generator) -> set[str]:
-    unique_values = sorted(set(values))
-    if len(unique_values) <= 1 or ratio <= 0.0:
-        return set()
-    n_test = int(round(len(unique_values) * ratio))
-    n_test = max(1, min(n_test, len(unique_values) - 1))
-    order = rng.permutation(len(unique_values))
-    return {unique_values[int(i)] for i in order[:n_test]}
+def make_requirement_folds(labels: pd.DataFrame, split_seed: int) -> pd.DataFrame:
+    """Assign each labeled requirement once, balancing size and positive-label status."""
+    has_positive = labels.groupby("o_id", sort=True)["label"].max().ge(0.5)
+    if len(has_positive) < 5:
+        raise ValueError("Five-fold evaluation requires at least five labeled requirements.")
+    if not has_positive.any():
+        raise ValueError("Ranking evaluation requires at least one labeled positive association.")
 
-
-def split_to_labels(
-    to_labels_df: pd.DataFrame,
-    test_ratio: float,
-    seed: int,
-    mode: str,
-) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
-    ratio = float(test_ratio)
-    if ratio < 0.0 or ratio >= 1.0:
-        raise ValueError(f"--label-test-ratio must be in [0, 1), got {test_ratio}")
-    labels = to_labels_df.copy().reset_index(drop=True)
-    if labels.empty or ratio <= 0.0:
-        train_df = labels.reset_index(drop=True)
-        test_df = labels.iloc[0:0].copy()
-    else:
-        rng = np.random.default_rng(int(seed))
-        if mode == "o_id":
-            o_has_pos = labels.groupby("o_id")["label"].max() >= 0.5
-            pos_o = o_has_pos[o_has_pos].index.astype(str).tolist()
-            no_pos_o = o_has_pos[~o_has_pos].index.astype(str).tolist()
-            test_o = _sample_holdout_values(pos_o, ratio, rng)
-            test_o |= _sample_holdout_values(no_pos_o, ratio, rng)
-            if not test_o and labels["o_id"].nunique() > 1:
-                test_o = _sample_holdout_values(labels["o_id"].astype(str).tolist(), ratio, rng)
-            is_test = labels["o_id"].astype(str).isin(test_o)
-        elif mode == "row":
-            test_indices: set[int] = set()
-            for _, group in labels.groupby(labels["label"] >= 0.5):
-                idxs = group.index.to_numpy(dtype=np.int64)
-                if idxs.size <= 1:
-                    continue
-                n_test = int(round(idxs.size * ratio))
-                n_test = max(1, min(n_test, idxs.size - 1))
-                chosen = rng.choice(idxs, size=n_test, replace=False)
-                test_indices.update(int(i) for i in chosen.tolist())
-            if not test_indices and len(labels) > 1:
-                chosen = int(rng.choice(labels.index.to_numpy(dtype=np.int64), size=1, replace=False)[0])
-                test_indices.add(chosen)
-            is_test = labels.index.isin(test_indices)
-        else:
-            raise ValueError(f"Unknown label split mode: {mode}")
-
-        train_df = labels.loc[~is_test].copy().reset_index(drop=True)
-        test_df = labels.loc[is_test].copy().reset_index(drop=True)
-
-    summary: dict[str, Any] = {
-        "label_split_mode": str(mode),
-        "label_test_ratio_requested": ratio,
-        "label_test_ratio_actual": float(len(test_df) / max(1, len(labels))),
-        "total_labels": int(len(labels)),
-    }
-    summary.update(label_split_stats(train_df, "train"))
-    summary.update(label_split_stats(test_df, "test"))
-    if train_df.empty and not labels.empty:
-        raise ValueError("TO label split produced an empty training set; reduce --label-test-ratio.")
-    if test_df.empty and ratio > 0.0:
-        print("[WARN] TO label split produced an empty test set; held-out evaluation will be skipped.")
-    if not train_df.empty and int((train_df["label"] >= 0.5).sum()) == 0:
-        print("[WARN] TO training split has no positive labels; edge supervision may be weak.")
-    if not test_df.empty and int((test_df["label"] >= 0.5).sum()) == 0:
-        print("[WARN] TO test split has no positive labels; Top-k metrics will be zero/empty.")
-    return train_df, test_df, summary
+    rng = np.random.default_rng(split_seed)
+    # A continuous round-robin across the two shuffled strata balances both
+    # the total number of requirements and the number with positives per fold.
+    ordered_ids = np.concatenate([
+        rng.permutation(has_positive.index[has_positive]),
+        rng.permutation(has_positive.index[~has_positive]),
+    ])
+    assignments = pd.DataFrame({
+        "o_id": ordered_ids,
+        "fold": np.arange(len(ordered_ids)) % 5 + 1,
+        "has_positive": has_positive.loc[ordered_ids].to_numpy(),
+    })
+    return assignments.sort_values("o_id").reset_index(drop=True)
 
 
 def normalize_priority(val: str) -> float:
@@ -628,19 +587,18 @@ def soft_penalty_for_to_edge(s_sem: float, s_stage: float, s_system: float) -> f
     return penalty
 
 
-def build_artifacts(
+def build_project_graph(
     t_df: pd.DataFrame,
     o_df: pd.DataFrame,
     tt_edges_df: pd.DataFrame,
-    to_labels_df: pd.DataFrame,
     model: SentenceTransformer,
     args: argparse.Namespace,
     device: torch.device,
-) -> BuildArtifacts:
+) -> ProjectGraph:
+    """Build shared, label-independent graph features once for all folds."""
     t_ids = t_df["t_id"].tolist()
     o_ids = o_df["o_id"].tolist()
     t_id_to_idx = {v: i for i, v in enumerate(t_ids)}
-    o_id_to_idx = {v: i for i, v in enumerate(o_ids)}
     n_t = len(t_df)
     n_o = len(o_df)
     node_offset_o = n_t
@@ -810,78 +768,6 @@ def build_artifacts(
     ot_edge_attr = to_edge_attr.clone()
     ot_edge_mask = to_edge_mask.clone()
 
-    labeled_t: list[int] = []
-    labeled_o: list[int] = []
-    labeled_feat: list[list[float]] = []
-    labeled_y: list[float] = []
-    labeled_w: list[float] = []
-    labeled_pair_set: set[tuple[int, int]] = set()
-    for _, row in to_labels_df.iterrows():
-        o_id = str(row["o_id"])
-        t_id = str(row["t_id"])
-        o_idx = o_id_to_idx[o_id]
-        t_idx = t_id_to_idx[t_id]
-        y = 1.0 if float(row["label"]) >= 0.5 else 0.0
-        w = max(0.0, float(row["weight"]))
-        labeled_pair_set.add((t_idx, o_idx))
-        labeled_t.append(t_idx)
-        labeled_o.append(o_idx)
-        labeled_feat.append(
-            [
-                float(s_sem[t_idx, o_idx]),
-                float(s_stage[t_idx, o_idx]),
-                float(s_system[t_idx, o_idx]),
-                float(s_space[t_idx, o_idx]),
-                float(s_priority[t_idx, o_idx]),
-            ]
-        )
-        labeled_y.append(y)
-        labeled_w.append(w)
-
-    labeled_t_global = torch.tensor(np.array(labeled_t, dtype=np.int64), dtype=torch.long, device=device) if labeled_t else torch.zeros((0,), dtype=torch.long, device=device)
-    labeled_o_global = torch.tensor(np.array([node_offset_o + i for i in labeled_o], dtype=np.int64), dtype=torch.long, device=device) if labeled_o else torch.zeros((0,), dtype=torch.long, device=device)
-    labeled_edge_attr = torch.tensor(np.array(labeled_feat, dtype=np.float32), dtype=torch.float32, device=device) if labeled_feat else torch.zeros((0, 5), dtype=torch.float32, device=device)
-    labeled_y_t = torch.tensor(np.array(labeled_y, dtype=np.float32), dtype=torch.float32, device=device) if labeled_y else torch.zeros((0,), dtype=torch.float32, device=device)
-    labeled_w_t = torch.tensor(np.array(labeled_w, dtype=np.float32), dtype=torch.float32, device=device) if labeled_w else torch.zeros((0,), dtype=torch.float32, device=device)
-
-    unlabeled_t: list[int] = []
-    unlabeled_o: list[int] = []
-    unlabeled_feat: list[list[float]] = []
-    unlabeled_sem: list[float] = []
-    unlabeled_by_o: dict[int, list[int]] = {i: [] for i in range(n_o)}
-    for edge_id in range(to_edge_index.shape[1]):
-        t_idx = int(to_edge_index[0, edge_id].item())
-        o_idx = int(to_edge_index[1, edge_id].item() - node_offset_o)
-        if (t_idx, o_idx) in labeled_pair_set:
-            continue
-        local_idx = len(unlabeled_t)
-        unlabeled_t.append(t_idx)
-        unlabeled_o.append(o_idx)
-        feat = to_edge_attr[edge_id].detach().cpu().numpy().tolist()
-        unlabeled_feat.append(feat)
-        unlabeled_sem.append(float(feat[0]))
-        unlabeled_by_o[o_idx].append(local_idx)
-
-    unlabeled_t_global = torch.tensor(np.array(unlabeled_t, dtype=np.int64), dtype=torch.long, device=device) if unlabeled_t else torch.zeros((0,), dtype=torch.long, device=device)
-    unlabeled_o_global = torch.tensor(np.array([node_offset_o + i for i in unlabeled_o], dtype=np.int64), dtype=torch.long, device=device) if unlabeled_o else torch.zeros((0,), dtype=torch.long, device=device)
-    unlabeled_edge_attr = torch.tensor(np.array(unlabeled_feat, dtype=np.float32), dtype=torch.float32, device=device) if unlabeled_feat else torch.zeros((0, 5), dtype=torch.float32, device=device)
-    unlabeled_sem_t = torch.tensor(np.array(unlabeled_sem, dtype=np.float32), dtype=torch.float32, device=device) if unlabeled_sem else torch.zeros((0,), dtype=torch.float32, device=device)
-
-    labeled_neg_by_o: dict[int, list[int]] = {i: [] for i in range(n_o)}
-    for i, (oo, yy) in enumerate(zip(labeled_o, labeled_y)):
-        if yy < 0.5:
-            labeled_neg_by_o[int(oo)].append(i)
-    for oo in labeled_neg_by_o:
-        labeled_neg_by_o[oo].sort(
-            key=lambda idx_: float(labeled_edge_attr[idx_, 0].item()) if labeled_edge_attr.shape[0] > idx_ else 0.0,
-            reverse=True,
-        )
-    for oo in unlabeled_by_o:
-        unlabeled_by_o[oo].sort(
-            key=lambda idx_: float(unlabeled_sem_t[idx_].item()) if unlabeled_sem_t.shape[0] > idx_ else 0.0,
-            reverse=True,
-        )
-
     n_nodes = n_t + n_o
     A = np.zeros((n_nodes, n_nodes), dtype=np.float32)
     if tt_edge_index.shape[1] > 0:
@@ -916,7 +802,7 @@ def build_artifacts(
     relation_edge_mask = {"TT": tt_edge_mask, "TO": to_edge_mask, "OT": ot_edge_mask}
     relation_edge_dims = {"TT": 5, "TO": 5, "OT": 5}
 
-    return BuildArtifacts(
+    return ProjectGraph(
         x_t=torch.tensor(x_t, dtype=torch.float32, device=device),
         x_o=torch.tensor(x_o, dtype=torch.float32, device=device),
         t_df=t_df,
@@ -935,868 +821,5 @@ def build_artifacts(
         to_sem_score=to_sem_score,
         to_stage_score=to_stage_score,
         to_space_score=to_space_score,
-        labeled_t_global=labeled_t_global,
-        labeled_o_global=labeled_o_global,
-        labeled_edge_attr=labeled_edge_attr,
-        labeled_y=labeled_y_t,
-        labeled_w=labeled_w_t,
-        unlabeled_t_global=unlabeled_t_global,
-        unlabeled_o_global=unlabeled_o_global,
-        unlabeled_edge_attr=unlabeled_edge_attr,
-        unlabeled_sem=unlabeled_sem_t,
         cluster_B=cluster_B,
-        cluster_m2=cluster_m2,
-        to_edge_by_o=to_edge_by_o,
-        labeled_neg_by_o=labeled_neg_by_o,
-        unlabeled_by_o=unlabeled_by_o,
-    )
-
-
-class MLP(nn.Module):
-    def __init__(self, in_dim: int, hidden_dim: int, out_dim: int, dropout: float):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(in_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, out_dim),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
-
-
-class RelationBlock(nn.Module):
-    def __init__(self, hidden_dim: int, edge_dim: int, dropout: float):
-        super().__init__()
-        self.hidden_dim = hidden_dim
-        self.w_q = nn.Linear(hidden_dim, hidden_dim, bias=False)
-        self.w_k = nn.Linear(hidden_dim, hidden_dim, bias=False)
-        self.w_e = nn.Linear(edge_dim, hidden_dim, bias=False)
-        self.msg_mlp = MLP(2 * hidden_dim + edge_dim, hidden_dim, hidden_dim, dropout)
-        self.attn_vec = nn.Parameter(torch.empty(3 * hidden_dim))
-        nn.init.xavier_uniform_(self.attn_vec.view(1, -1))
-        self.gate = nn.Linear(hidden_dim, 1, bias=True)
-        self.leaky_relu = nn.LeakyReLU(0.2)
-
-    def forward(
-        self,
-        h: torch.Tensor,
-        edge_index: torch.Tensor,
-        edge_attr: torch.Tensor,
-        edge_mask: torch.Tensor,
-        num_nodes: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        if edge_index.numel() == 0:
-            return (
-                torch.zeros((num_nodes, self.hidden_dim), dtype=h.dtype, device=h.device),
-                torch.zeros((num_nodes,), dtype=torch.bool, device=h.device),
-            )
-        src, dst = edge_index[0], edge_index[1]
-        h_i = h[dst]
-        h_j = h[src]
-        msg = self.msg_mlp(torch.cat([h_i, h_j, edge_attr], dim=-1))
-        attn_in = torch.cat([self.w_q(h_i), self.w_k(h_j), self.w_e(edge_attr)], dim=-1)
-        logits = self.leaky_relu(torch.sum(attn_in * self.attn_vec, dim=-1) + edge_mask)
-        alpha = pyg_softmax(logits, dst, num_nodes=num_nodes)
-        out = torch.zeros((num_nodes, self.hidden_dim), dtype=h.dtype, device=h.device)
-        out.index_add_(0, dst, msg * alpha.unsqueeze(-1))
-        incoming = torch.zeros((num_nodes,), dtype=torch.bool, device=h.device)
-        incoming[dst] = True
-        return out, incoming
-
-
-class RelationAwareLayer(nn.Module):
-    def __init__(self, hidden_dim: int, relation_edge_dims: dict[str, int], dropout: float):
-        super().__init__()
-        self.blocks = nn.ModuleDict(
-            {name: RelationBlock(hidden_dim, edge_dim, dropout) for name, edge_dim in relation_edge_dims.items()}
-        )
-        self.w0 = nn.Linear(hidden_dim, hidden_dim, bias=True)
-        self.dropout = nn.Dropout(dropout)
-        self.act = nn.ELU()
-
-    def forward(
-        self,
-        h: torch.Tensor,
-        relation_edge_index: dict[str, torch.Tensor],
-        relation_edge_attr: dict[str, torch.Tensor],
-        relation_edge_mask: dict[str, torch.Tensor],
-    ) -> torch.Tensor:
-        num_nodes = h.shape[0]
-        z_list: list[torch.Tensor] = []
-        inc_list: list[torch.Tensor] = []
-        gate_list: list[torch.Tensor] = []
-
-        for rel_name, block in self.blocks.items():
-            z, incoming = block(
-                h=h,
-                edge_index=relation_edge_index[rel_name],
-                edge_attr=relation_edge_attr[rel_name],
-                edge_mask=relation_edge_mask[rel_name],
-                num_nodes=num_nodes,
-            )
-            z_list.append(z)
-            inc_list.append(incoming)
-            gate_list.append(block.gate(z).squeeze(-1))
-
-        if not z_list:
-            return self.act(self.w0(h))
-
-        z_stack = torch.stack(z_list, dim=0)   # [R, N, d]
-        inc_stack = torch.stack(inc_list, dim=0)  # [R, N]
-        gate_stack = torch.stack(gate_list, dim=0).masked_fill(~inc_stack, -1e9)  # [R, N]
-
-        beta = torch.softmax(gate_stack, dim=0)
-        beta = torch.where(inc_stack, beta, torch.zeros_like(beta))
-        beta = beta / (beta.sum(dim=0, keepdim=True) + EPS)
-
-        rel_agg = torch.sum(beta.unsqueeze(-1) * z_stack, dim=0)
-        return self.dropout(self.act(self.w0(h) + rel_agg))
-
-
-class MultiHeadRelationLayer(nn.Module):
-    def __init__(self, hidden_dim: int, relation_edge_dims: dict[str, int], dropout: float, heads: int):
-        super().__init__()
-        self.heads = nn.ModuleList(
-            [RelationAwareLayer(hidden_dim, relation_edge_dims, dropout) for _ in range(heads)]
-        )
-        self.proj = nn.Linear(hidden_dim * heads, hidden_dim)
-        self.dropout = nn.Dropout(dropout)
-        self.act = nn.ELU()
-        self.norm = nn.LayerNorm(hidden_dim)
-
-    def forward(
-        self,
-        h: torch.Tensor,
-        relation_edge_index: dict[str, torch.Tensor],
-        relation_edge_attr: dict[str, torch.Tensor],
-        relation_edge_mask: dict[str, torch.Tensor],
-    ) -> torch.Tensor:
-        outs = [head(h, relation_edge_index, relation_edge_attr, relation_edge_mask) for head in self.heads]
-        delta = self.dropout(self.act(self.proj(torch.cat(outs, dim=-1))))
-        return self.norm(h + delta)
-
-
-class SpatioSemanticGAT(nn.Module):
-    def __init__(
-        self,
-        t_in_dim: int,
-        o_in_dim: int,
-        hidden_dim: int,
-        num_layers: int,
-        heads: int,
-        dropout: float,
-        num_clusters: int,
-        cluster_temp: float,
-        relation_edge_dims: dict[str, int],
-    ):
-        super().__init__()
-        self.hidden_dim = hidden_dim
-        self.base_cluster_temp = max(float(cluster_temp), 1e-3)
-        self.cluster_temp = self.base_cluster_temp
-        self.t_proj = MLP(t_in_dim, hidden_dim, hidden_dim, dropout)
-        self.o_proj = MLP(o_in_dim, hidden_dim, hidden_dim, dropout)
-        self.layers = nn.ModuleList(
-            [
-                MultiHeadRelationLayer(hidden_dim, relation_edge_dims, dropout, heads)
-                for _ in range(num_layers)
-            ]
-        )
-        self.cluster_head = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, num_clusters),
-        )
-        self.edge_head = nn.Sequential(
-            nn.Linear(3 * hidden_dim + 5, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, 1),
-        )
-        self.w_tt = nn.Parameter(torch.empty((hidden_dim, hidden_dim)))
-        nn.init.xavier_uniform_(self.w_tt)
-
-    def set_cluster_temp(self, value: float) -> None:
-        self.cluster_temp = max(float(value), 1e-3)
-
-    def forward(
-        self,
-        x_t: torch.Tensor,
-        x_o: torch.Tensor,
-        relation_edge_index: dict[str, torch.Tensor],
-        relation_edge_attr: dict[str, torch.Tensor],
-        relation_edge_mask: dict[str, torch.Tensor],
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        h = torch.cat([self.t_proj(x_t), self.o_proj(x_o)], dim=0)
-        for layer in self.layers:
-            h = layer(h, relation_edge_index, relation_edge_attr, relation_edge_mask)
-        s = torch.softmax(self.cluster_head(h) / self.cluster_temp, dim=-1)
-        return h, s
-
-    def score_to_edges(
-        self,
-        h: torch.Tensor,
-        t_global: torch.Tensor,
-        o_global: torch.Tensor,
-        edge_attr: torch.Tensor,
-    ) -> torch.Tensor:
-        if t_global.numel() == 0:
-            return torch.zeros((0,), dtype=h.dtype, device=h.device)
-        h_t = h[t_global]
-        h_o = h[o_global]
-        feat = torch.cat([h_t, h_o, h_t * h_o, edge_attr], dim=-1)
-        return self.edge_head(feat).squeeze(-1)
-
-    def score_tt_edges(self, h: torch.Tensor, src: torch.Tensor, dst: torch.Tensor) -> torch.Tensor:
-        if src.numel() == 0:
-            return torch.zeros((0,), dtype=h.dtype, device=h.device)
-        h_src = h[src]
-        h_dst = h[dst]
-        return torch.sum((h_src @ self.w_tt) * h_dst, dim=-1)
-
-
-def sample_tt_negative_edges(
-    n_t: int,
-    pos_src: torch.Tensor,
-    pos_dst: torch.Tensor,
-    neg_ratio: float,
-    device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    n_pos = int(pos_src.shape[0])
-    n_neg = max(1, int(n_pos * neg_ratio)) if n_pos > 0 else max(1, int(n_t * 0.5))
-    existing = {(int(s), int(d)) for s, d in zip(pos_src.detach().cpu().tolist(), pos_dst.detach().cpu().tolist())}
-    neg_s: list[int] = []
-    neg_d: list[int] = []
-    tries = 0
-    max_tries = max(1000, n_neg * 20)
-    while len(neg_s) < n_neg and tries < max_tries:
-        s = random.randint(0, max(0, n_t - 1))
-        d = random.randint(0, max(0, n_t - 1))
-        tries += 1
-        if s == d or (s, d) in existing:
-            continue
-        existing.add((s, d))
-        neg_s.append(s)
-        neg_d.append(d)
-    if not neg_s:
-        return torch.zeros((0,), dtype=torch.long, device=device), torch.zeros((0,), dtype=torch.long, device=device)
-    return torch.tensor(neg_s, dtype=torch.long, device=device), torch.tensor(neg_d, dtype=torch.long, device=device)
-
-
-def sample_edge_supervision(
-    artifacts: BuildArtifacts,
-    hard_neg_ratio: int,
-    device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    if artifacts.labeled_y.numel() == 0:
-        return (
-            torch.zeros((0,), dtype=torch.long, device=device),
-            torch.zeros((0,), dtype=torch.long, device=device),
-            torch.zeros((0, 5), dtype=torch.float32, device=device),
-            torch.zeros((0,), dtype=torch.float32, device=device),
-            torch.zeros((0,), dtype=torch.float32, device=device),
-        )
-
-    pos_idx = torch.where(artifacts.labeled_y >= 0.5)[0].detach().cpu().tolist()
-    neg_idx_global = torch.where(artifacts.labeled_y < 0.5)[0].detach().cpu().tolist()
-    if not pos_idx:
-        return (
-            artifacts.labeled_t_global,
-            artifacts.labeled_o_global,
-            artifacts.labeled_edge_attr,
-            artifacts.labeled_y,
-            torch.clamp(artifacts.labeled_w, min=1e-3),
-        )
-
-    selected_indices: list[int] = []
-    sampled_unlabeled: list[int] = []
-    pos_by_o: dict[int, list[int]] = {}
-    n_t = len(artifacts.t_ids)
-    for i in pos_idx:
-        o_local = int(artifacts.labeled_o_global[i].item()) - n_t
-        pos_by_o.setdefault(o_local, []).append(i)
-
-    used_labeled_neg: set[int] = set()
-    used_unlabeled: set[int] = set()
-    for o_local, pos_list in pos_by_o.items():
-        selected_indices.extend(pos_list)
-        need_neg = max(1, hard_neg_ratio * len(pos_list))
-        neg_candidates = artifacts.labeled_neg_by_o.get(o_local, [])
-        take_lab = [i for i in neg_candidates if i not in used_labeled_neg][:need_neg]
-        for idx_ in take_lab:
-            used_labeled_neg.add(idx_)
-        selected_indices.extend(take_lab)
-        remain = need_neg - len(take_lab)
-        if remain > 0:
-            cand_u = artifacts.unlabeled_by_o.get(o_local, [])
-            take_u = [i for i in cand_u if i not in used_unlabeled][:remain]
-            for idx_ in take_u:
-                used_unlabeled.add(idx_)
-            sampled_unlabeled.extend(take_u)
-
-    extra_neg_pool = [i for i in neg_idx_global if i not in used_labeled_neg]
-    random.shuffle(extra_neg_pool)
-    selected_indices.extend(extra_neg_pool[: max(0, len(pos_idx) // 2)])
-
-    if selected_indices:
-        idx_t = torch.tensor(sorted(set(selected_indices)), dtype=torch.long, device=device)
-        t_l = artifacts.labeled_t_global[idx_t]
-        o_l = artifacts.labeled_o_global[idx_t]
-        e_l = artifacts.labeled_edge_attr[idx_t]
-        y_l = artifacts.labeled_y[idx_t]
-        w_l = torch.clamp(artifacts.labeled_w[idx_t], min=1e-3)
-    else:
-        t_l = torch.zeros((0,), dtype=torch.long, device=device)
-        o_l = torch.zeros((0,), dtype=torch.long, device=device)
-        e_l = torch.zeros((0, 5), dtype=torch.float32, device=device)
-        y_l = torch.zeros((0,), dtype=torch.float32, device=device)
-        w_l = torch.zeros((0,), dtype=torch.float32, device=device)
-
-    if sampled_unlabeled:
-        idx_u = torch.tensor(sorted(set(sampled_unlabeled)), dtype=torch.long, device=device)
-        t_l = torch.cat([t_l, artifacts.unlabeled_t_global[idx_u]], dim=0)
-        o_l = torch.cat([o_l, artifacts.unlabeled_o_global[idx_u]], dim=0)
-        e_l = torch.cat([e_l, artifacts.unlabeled_edge_attr[idx_u]], dim=0)
-        y_l = torch.cat([y_l, torch.zeros((idx_u.shape[0],), dtype=torch.float32, device=device)], dim=0)
-        w_l = torch.cat([w_l, torch.ones((idx_u.shape[0],), dtype=torch.float32, device=device)], dim=0)
-    return t_l, o_l, e_l, y_l, w_l
-
-
-def compute_losses(
-    model: SpatioSemanticGAT,
-    h: torch.Tensor,
-    s: torch.Tensor,
-    artifacts: BuildArtifacts,
-    args: argparse.Namespace,
-    device: torch.device,
-) -> tuple[torch.Tensor, dict[str, float]]:
-    pos_logits = model.score_tt_edges(h, artifacts.tt_pos_src, artifacts.tt_pos_dst)
-    neg_src, neg_dst = sample_tt_negative_edges(
-        n_t=len(artifacts.t_ids),
-        pos_src=artifacts.tt_pos_src,
-        pos_dst=artifacts.tt_pos_dst,
-        neg_ratio=float(args.tt_neg_ratio),
-        device=device,
-    )
-    neg_logits = model.score_tt_edges(h, neg_src, neg_dst)
-    l_pos = F.binary_cross_entropy_with_logits(pos_logits, torch.ones_like(pos_logits)) if pos_logits.numel() > 0 else torch.tensor(0.0, dtype=torch.float32, device=device)
-    l_neg = F.binary_cross_entropy_with_logits(neg_logits, torch.zeros_like(neg_logits)) if neg_logits.numel() > 0 else torch.tensor(0.0, dtype=torch.float32, device=device)
-    l_rec = l_pos + l_neg
-
-    t_sup, o_sup, e_sup, y_sup, w_sup = sample_edge_supervision(artifacts, int(args.hard_neg_ratio), device)
-    if y_sup.numel() > 0:
-        y_logits = model.score_to_edges(h, t_sup, o_sup, e_sup)
-        raw = F.binary_cross_entropy_with_logits(y_logits, y_sup, reduction="none")
-        l_edge = torch.sum(raw * w_sup) / (torch.sum(w_sup) + EPS)
-    else:
-        l_edge = torch.tensor(0.0, dtype=torch.float32, device=device)
-
-    stbs = torch.matmul(s.t(), torch.matmul(artifacts.cluster_B, s))
-    # Normalize modularity scale by graph volume m2 to avoid magnitude exploding with graph size.
-    modularity_term = -torch.trace(stbs) / max(float(artifacts.cluster_m2), 1.0)
-    gram = torch.matmul(s.t(), s)
-    off_diag = gram - torch.diag(torch.diag(gram))
-    # Normalize orthogonality penalty by node count for stable scale across datasets.
-    orth_term = torch.norm(off_diag, p="fro") / max(float(s.shape[0]), 1.0)
-    n_t = int(len(artifacts.t_ids))
-    n_nodes = max(int(s.shape[0]), 1)
-    type_th = float(np.clip(float(args.type_dominance_th), 0.5, 1.0))
-    t_mass = torch.sum(s[:n_t], dim=0) if n_t > 0 else torch.zeros((s.shape[1],), dtype=s.dtype, device=s.device)
-    o_mass = torch.sum(s[n_t:], dim=0) if n_t < s.shape[0] else torch.zeros((s.shape[1],), dtype=s.dtype, device=s.device)
-    total_mass = torch.clamp(t_mass + o_mass, min=EPS)
-    t_share = t_mass / total_mass
-    o_share = o_mass / total_mass
-    dominance = torch.maximum(t_share, o_share)
-    excess = F.relu(dominance - type_th)
-    # Weight by cluster usage to avoid over-penalizing tiny/unused clusters.
-    usage = total_mass / float(n_nodes)
-    l_type_dominance = torch.sum((excess * excess) * usage) / (torch.sum(usage) + EPS)
-    l_clus = modularity_term + float(args.lambda_offdiag) * orth_term
-
-    # Cluster usage balance regularizer:
-    # KL(mean_cluster_prob || uniform), minimizing it discourages collapsing into a few clusters.
-    mean_cluster_prob = torch.clamp(torch.mean(s, dim=0), min=EPS)
-    num_clusters = mean_cluster_prob.shape[0]
-    l_balance = torch.sum(mean_cluster_prob * torch.log(mean_cluster_prob * float(num_clusters)))
-    max_cluster_share = torch.max(mean_cluster_prob)
-    share_floor = 1.0 / max(float(num_clusters), 1.0)
-    max_share_target = float(np.clip(float(args.max_cluster_share), share_floor, 1.0))
-    l_collapse = F.relu(max_cluster_share - max_share_target) ** 2
-    if artifacts.to_t_global.numel() > 0:
-        pi = torch.sum(s[artifacts.to_t_global] * s[artifacts.to_o_global], dim=-1)
-        g_time = artifacts.to_stage_score
-        g_sem = F.relu(artifacts.to_sem_score - float(args.tau_sem))
-        l_st = torch.mean((1.0 - pi) * artifacts.to_space_score * g_time * g_sem)
-    else:
-        l_st = torch.tensor(0.0, dtype=torch.float32, device=device)
-
-    total = (
-        float(args.alpha) * l_rec
-        + float(args.beta) * l_edge
-        + float(args.gamma) * l_clus
-        + float(args.delta) * l_st
-        + float(args.lambda_type_dominance) * l_type_dominance
-        + float(args.lambda_balance) * l_balance
-        + float(args.lambda_collapse) * l_collapse
-    )
-    metrics = {
-        "loss_total": float(total.detach().item()),
-        "loss_rec_tt": float(l_rec.detach().item()),
-        "loss_edge": float(l_edge.detach().item()),
-        "loss_clus": float(l_clus.detach().item()),
-        "loss_type_dominance": float(l_type_dominance.detach().item()),
-        "loss_st": float(l_st.detach().item()),
-        "loss_balance": float(l_balance.detach().item()),
-        "loss_collapse": float(l_collapse.detach().item()),
-        "sup_edges": float(y_sup.numel()),
-    }
-    return total, metrics
-
-
-def run_shape_checks(model: SpatioSemanticGAT, artifacts: BuildArtifacts) -> None:
-    with torch.no_grad():
-        h, s = model(
-            x_t=artifacts.x_t,
-            x_o=artifacts.x_o,
-            relation_edge_index=artifacts.relation_edge_index,
-            relation_edge_attr=artifacts.relation_edge_attr,
-            relation_edge_mask=artifacts.relation_edge_mask,
-        )
-        n_nodes = len(artifacts.t_ids) + len(artifacts.o_ids)
-        if h.shape != (n_nodes, model.hidden_dim):
-            raise RuntimeError(f"Encoder output shape mismatch: got {h.shape}, expected {(n_nodes, model.hidden_dim)}")
-        if s.shape[0] != n_nodes:
-            raise RuntimeError(f"Cluster output node count mismatch: {s.shape[0]} vs {n_nodes}")
-        if torch.isnan(h).any() or torch.isnan(s).any():
-            raise RuntimeError("Forward output contains NaN")
-
-
-def compute_annealed_temp(args: argparse.Namespace, epoch: int, max_epochs: int) -> float:
-    base = max(float(args.cluster_temp), 1e-3)
-    t_min = max(min(float(args.cluster_temp_min), base), 1e-3)
-    if str(args.cluster_temp_anneal) == "none" or max_epochs <= 1:
-        return base
-    progress = float(epoch) / float(max(1, max_epochs - 1))
-    return base - (base - t_min) * progress
-
-
-def lr_scale_at_epoch(args: argparse.Namespace, epoch: int, max_epochs: int) -> float:
-    if max_epochs <= 1:
-        return 1.0
-    warmup = max(0, int(args.warmup_epochs))
-    min_scale = float(np.clip(float(args.min_lr_scale), 0.0, 1.0))
-    if warmup > 0 and epoch < warmup:
-        return float((epoch + 1) / warmup)
-    after = max(0, epoch - warmup)
-    total_after = max(1, max_epochs - warmup)
-    progress = float(after) / float(total_after)
-    cosine = 0.5 * (1.0 + np.cos(np.pi * progress))
-    return float(min_scale + (1.0 - min_scale) * cosine)
-
-
-def train(
-    model: SpatioSemanticGAT,
-    artifacts: BuildArtifacts,
-    args: argparse.Namespace,
-    device: torch.device,
-) -> tuple[SpatioSemanticGAT, list[dict[str, float]], int]:
-    base_lr = float(args.lr)
-    grad_clip = max(float(args.grad_clip), 0.0)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=base_lr, weight_decay=float(args.weight_decay))
-    best_state: dict[str, Any] | None = None
-    best_temp = float(args.cluster_temp)
-    best_loss = float("inf")
-    best_epoch = -1
-    bad_epochs = 0
-    history: list[dict[str, float]] = []
-    max_epochs = int(args.smoke_epochs) if int(args.smoke_epochs) > 0 else int(args.epochs)
-
-    for epoch in range(max_epochs):
-        cur_temp = compute_annealed_temp(args, epoch, max_epochs)
-        model.set_cluster_temp(cur_temp)
-        lr_scale = lr_scale_at_epoch(args, epoch, max_epochs)
-        cur_lr = base_lr * lr_scale
-        for group in optimizer.param_groups:
-            group["lr"] = cur_lr
-        model.train()
-        optimizer.zero_grad()
-        h, s = model(
-            x_t=artifacts.x_t,
-            x_o=artifacts.x_o,
-            relation_edge_index=artifacts.relation_edge_index,
-            relation_edge_attr=artifacts.relation_edge_attr,
-            relation_edge_mask=artifacts.relation_edge_mask,
-        )
-        total_loss, metrics = compute_losses(model, h, s, artifacts, args, device)
-        if torch.isnan(total_loss):
-            raise RuntimeError(f"Loss is NaN at epoch {epoch}. Check data and thresholds.")
-        total_loss.backward()
-        if grad_clip > 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
-        optimizer.step()
-
-        metrics["epoch"] = float(epoch)
-        metrics["lr"] = float(cur_lr)
-        metrics["cluster_temp"] = float(cur_temp)
-        history.append(metrics)
-        print(
-            f"[Epoch {epoch:03d}] total={metrics['loss_total']:.6f} "
-            f"rec={metrics['loss_rec_tt']:.6f} edge={metrics['loss_edge']:.6f} "
-            f"clus={metrics['loss_clus']:.6f} st={metrics['loss_st']:.6f} "
-            f"typedom={metrics['loss_type_dominance']:.6f} bal={metrics['loss_balance']:.6f} "
-            f"col={metrics['loss_collapse']:.6f} "
-            f"temp={metrics['cluster_temp']:.4f} lr={metrics['lr']:.6g}"
-        )
-
-        cur_loss = metrics["loss_total"]
-        if cur_loss + 1e-8 < best_loss:
-            best_loss = cur_loss
-            best_epoch = epoch
-            bad_epochs = 0
-            best_state = copy.deepcopy(model.state_dict())
-            best_temp = cur_temp
-        else:
-            bad_epochs += 1
-            if int(args.smoke_epochs) <= 0 and bad_epochs >= int(args.patience):
-                print(f"[EarlyStop] patience={args.patience} reached at epoch={epoch}.")
-                break
-
-    if best_state is None:
-        raise RuntimeError("Training did not produce a valid model state.")
-    model.load_state_dict(best_state)
-    model.set_cluster_temp(best_temp)
-    return model, history, best_epoch
-
-
-def evaluate_ranked_labels(
-    rows_rank: list[dict[str, Any]],
-    labels_df: pd.DataFrame,
-    ks: list[int],
-) -> tuple[dict[str, Any], pd.DataFrame, pd.DataFrame]:
-    labels = labels_df.copy()
-    if labels.empty:
-        k_eval_df = pd.DataFrame(
-            [
-                {
-                    "k": int(k),
-                    "num_o_with_pos": 0,
-                    "hitrate_at_k": 0.0,
-                    "recall_macro_at_k": 0.0,
-                    "recall_micro_at_k": 0.0,
-                    "hit_count": 0,
-                    "retrieved_relevant_total": 0,
-                    "relevant_total": 0,
-                }
-                for k in ks
-            ]
-        )
-        per_o_df = pd.DataFrame(columns=["o_id", "num_pos", "first_hit_rank", "mrr"])
-        return {
-            "num_o_in_labels": 0,
-            "num_o_with_pos": 0,
-            "num_o_without_pos": 0,
-            "mrr": 0.0,
-            "avg_first_hit_rank": float("nan"),
-        }, k_eval_df, per_o_df
-
-    labels["o_id"] = labels["o_id"].astype(str)
-    labels["t_id"] = labels["t_id"].astype(str)
-    labels["label"] = pd.to_numeric(labels["label"], errors="coerce").fillna(0.0)
-    labels_pos = labels[labels["label"] >= 0.5].copy()
-    pos_by_o = labels_pos.groupby("o_id")["t_id"].apply(set).to_dict()
-    all_o_with_pos = sorted(pos_by_o.keys())
-    o_all_in_labels = sorted(labels["o_id"].unique().tolist())
-    o_without_pos = sorted(set(o_all_in_labels) - set(all_o_with_pos))
-
-    ranked_df = pd.DataFrame(rows_rank)
-    if ranked_df.empty:
-        ranked_by_o: dict[str, pd.DataFrame] = {}
-    else:
-        ranked_df = ranked_df.copy()
-        ranked_df["o_id"] = ranked_df["o_id"].astype(str)
-        ranked_df["t_id"] = ranked_df["t_id"].astype(str)
-        ranked_df["rank"] = pd.to_numeric(ranked_df["rank"], errors="coerce")
-        ranked_by_o = {o: g.sort_values("rank") for o, g in ranked_df.groupby("o_id", sort=False)}
-
-    first_hit_rows: list[dict[str, Any]] = []
-    for o_id in all_o_with_pos:
-        pos_set = pos_by_o[o_id]
-        ranked = ranked_by_o.get(o_id)
-        first_hit_rank = None
-        if ranked is not None and not ranked.empty:
-            hit_ranks = ranked.loc[ranked["t_id"].isin(pos_set), "rank"].dropna().tolist()
-            if hit_ranks:
-                first_hit_rank = int(min(hit_ranks))
-        first_hit_rows.append(
-            {
-                "o_id": o_id,
-                "num_pos": int(len(pos_set)),
-                "first_hit_rank": first_hit_rank,
-                "mrr": float(1.0 / first_hit_rank) if first_hit_rank else 0.0,
-            }
-        )
-
-    if first_hit_rows:
-        per_o_df = pd.DataFrame(first_hit_rows).sort_values("o_id").reset_index(drop=True)
-    else:
-        per_o_df = pd.DataFrame(columns=["o_id", "num_pos", "first_hit_rank", "mrr"])
-
-    k_rows: list[dict[str, Any]] = []
-    for k in ks:
-        hits_binary: list[int] = []
-        recalls: list[float] = []
-        hit_count = 0
-        retrieved_relevant_total = 0
-        relevant_total = 0
-        for o_id in all_o_with_pos:
-            pos_set = pos_by_o[o_id]
-            ranked = ranked_by_o.get(o_id)
-            topk_ids: list[str] = []
-            if ranked is not None and not ranked.empty:
-                topk_ids = ranked.loc[ranked["rank"] <= int(k), "t_id"].tolist()
-            tp = len(set(topk_ids) & pos_set)
-            rec = float(tp / max(1, len(pos_set)))
-            hit = 1 if tp > 0 else 0
-            recalls.append(rec)
-            hits_binary.append(hit)
-            hit_count += hit
-            retrieved_relevant_total += tp
-            relevant_total += len(pos_set)
-
-        k_rows.append(
-            {
-                "k": int(k),
-                "num_o_with_pos": int(len(all_o_with_pos)),
-                "hitrate_at_k": float(np.mean(hits_binary)) if hits_binary else 0.0,
-                "recall_macro_at_k": float(np.mean(recalls)) if recalls else 0.0,
-                "recall_micro_at_k": float(retrieved_relevant_total / max(1, relevant_total)),
-                "hit_count": int(hit_count),
-                "retrieved_relevant_total": int(retrieved_relevant_total),
-                "relevant_total": int(relevant_total),
-            }
-        )
-
-        if not per_o_df.empty:
-            hit_col = f"hit_at_{int(k)}"
-            rec_col = f"recall_at_{int(k)}"
-            per_o_df[hit_col] = 0
-            per_o_df[rec_col] = 0.0
-            for i, o_id in enumerate(per_o_df["o_id"].tolist()):
-                pos_set = pos_by_o[o_id]
-                ranked = ranked_by_o.get(o_id)
-                topk_ids = []
-                if ranked is not None and not ranked.empty:
-                    topk_ids = ranked.loc[ranked["rank"] <= int(k), "t_id"].tolist()
-                tp = len(set(topk_ids) & pos_set)
-                per_o_df.loc[i, hit_col] = 1 if tp > 0 else 0
-                per_o_df.loc[i, rec_col] = float(tp / max(1, len(pos_set)))
-
-    k_eval_df = pd.DataFrame(k_rows)
-    mrr = float(per_o_df["mrr"].mean()) if not per_o_df.empty else 0.0
-    avg_first_hit_rank = (
-        float(per_o_df.loc[per_o_df["first_hit_rank"].notna(), "first_hit_rank"].mean())
-        if not per_o_df.empty and per_o_df["first_hit_rank"].notna().any()
-        else float("nan")
-    )
-    summary: dict[str, Any] = {
-        "num_o_in_labels": int(len(o_all_in_labels)),
-        "num_o_with_pos": int(len(all_o_with_pos)),
-        "num_o_without_pos": int(len(o_without_pos)),
-        "mrr": mrr,
-        "avg_first_hit_rank": avg_first_hit_rank,
-    }
-    for _, row in k_eval_df.iterrows():
-        k = int(row["k"])
-        summary[f"hitrate_at_{k}"] = float(row["hitrate_at_k"])
-        summary[f"recall_macro_at_{k}"] = float(row["recall_macro_at_k"])
-        summary[f"recall_micro_at_{k}"] = float(row["recall_micro_at_k"])
-    return summary, k_eval_df, per_o_df
-
-
-def export_results(
-    model: SpatioSemanticGAT,
-    artifacts: BuildArtifacts,
-    args: argparse.Namespace,
-    out_dir: Path,
-    ckpt_dir: Path,
-    best_epoch: int,
-    history: list[dict[str, float]],
-    train_labels_df: pd.DataFrame,
-    test_labels_df: pd.DataFrame,
-    label_split_summary: dict[str, Any],
-) -> None:
-    out_dir.mkdir(parents=True, exist_ok=True)
-    ckpt_dir.mkdir(parents=True, exist_ok=True)
-    train_labels_df.to_csv(out_dir / "to_labels_train.csv", index=False, encoding="utf-8")
-    test_labels_df.to_csv(out_dir / "to_labels_test.csv", index=False, encoding="utf-8")
-
-    model.eval()
-    with torch.no_grad():
-        h, s = model(
-            x_t=artifacts.x_t,
-            x_o=artifacts.x_o,
-            relation_edge_index=artifacts.relation_edge_index,
-            relation_edge_attr=artifacts.relation_edge_attr,
-            relation_edge_mask=artifacts.relation_edge_mask,
-        )
-        to_prob = torch.sigmoid(model.score_to_edges(h, artifacts.to_t_global, artifacts.to_o_global, artifacts.to_edge_attr)).detach().cpu().numpy()
-        s_np = s.detach().cpu().numpy()
-
-    rows_rank: list[dict[str, Any]] = []
-    n_t = len(artifacts.t_ids)
-    for o_local, edge_ids in artifacts.to_edge_by_o.items():
-        if not edge_ids:
-            continue
-        edge_scores = [(eid, float(to_prob[eid])) for eid in edge_ids]
-        edge_scores.sort(key=lambda x: x[1], reverse=True)
-        for rk, (eid, score) in enumerate(edge_scores[: int(args.topk)], start=1):
-            t_global = int(artifacts.to_t_global[eid].item())
-            o_idx = int(artifacts.to_o_global[eid].item() - n_t)
-            rows_rank.append(
-                {
-                    "o_id": artifacts.o_ids[o_idx],
-                    "t_id": artifacts.t_ids[t_global],
-                    "rank": rk,
-                    "score": score,
-                    "s_sem": float(artifacts.to_edge_attr[eid, 0].item()),
-                    "s_stage": float(artifacts.to_edge_attr[eid, 1].item()),
-                    "s_system": float(artifacts.to_edge_attr[eid, 2].item()),
-                    "s_space": float(artifacts.to_edge_attr[eid, 3].item()),
-                    "s_priority": float(artifacts.to_edge_attr[eid, 4].item()),
-                }
-            )
-    rows_rank_df = pd.DataFrame(rows_rank)
-    rows_rank_df.to_csv(out_dir / "o_to_topk.csv", index=False, encoding="utf-8")
-    eval_ks = parse_eval_ks(str(args.eval_ks), int(args.topk))
-    test_summary, test_k_eval_df, test_per_o_df = evaluate_ranked_labels(rows_rank, test_labels_df, eval_ks)
-    test_k_eval_df.to_csv(out_dir / "test_topk_eval_by_k.csv", index=False, encoding="utf-8")
-    test_per_o_df.to_csv(out_dir / "test_per_o_eval.csv", index=False, encoding="utf-8")
-
-    k = s_np.shape[1]
-    cluster_rows: list[dict[str, Any]] = []
-    for i, t_id in enumerate(artifacts.t_ids):
-        row: dict[str, Any] = {"node_id": t_id, "node_type": "T", "hard_cluster": int(np.argmax(s_np[i]))}
-        for c in range(k):
-            row[f"cluster_prob_{c}"] = float(s_np[i, c])
-        cluster_rows.append(row)
-    for j, o_id in enumerate(artifacts.o_ids):
-        idx = len(artifacts.t_ids) + j
-        row = {"node_id": o_id, "node_type": "O", "hard_cluster": int(np.argmax(s_np[idx]))}
-        for c in range(k):
-            row[f"cluster_prob_{c}"] = float(s_np[idx, c])
-        cluster_rows.append(row)
-    pd.DataFrame(cluster_rows).to_csv(out_dir / "node_clusters.csv", index=False, encoding="utf-8")
-
-    payload = {
-        "best_epoch": int(best_epoch),
-        "best_loss": float(min(x["loss_total"] for x in history) if history else float("nan")),
-        "epochs_ran": int(len(history)),
-        "loss_coefficients": {
-            "alpha": float(args.alpha),
-            "beta": float(args.beta),
-            "gamma": float(args.gamma),
-            "delta": float(args.delta),
-            "lambda_offdiag": float(args.lambda_offdiag),
-            "lambda_type_dominance": float(args.lambda_type_dominance),
-            "lambda_balance": float(args.lambda_balance),
-            "lambda_collapse": float(args.lambda_collapse),
-        },
-        "cluster_config": {
-            "cluster_temp": float(args.cluster_temp),
-            "cluster_temp_min": float(args.cluster_temp_min),
-            "cluster_temp_anneal": str(args.cluster_temp_anneal),
-            "max_cluster_share": float(args.max_cluster_share),
-            "disable_losses": str(args.disable_losses),
-        },
-        "label_split": label_split_summary,
-        "test_topk_summary": test_summary,
-        "test_topk_by_k": json.loads(test_k_eval_df.to_json(orient="records")),
-        "history": history,
-    }
-    with (out_dir / "train_metrics.json").open("w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
-
-    ckpt_path = ckpt_dir / "gat_best.pt"
-    torch.save(model.state_dict(), ckpt_path)
-    print(f"[Saved] {out_dir / 'o_to_topk.csv'}")
-    print(f"[Saved] {out_dir / 'node_clusters.csv'}")
-    print(f"[Saved] {out_dir / 'to_labels_train.csv'}")
-    print(f"[Saved] {out_dir / 'to_labels_test.csv'}")
-    print(f"[Saved] {out_dir / 'test_topk_eval_by_k.csv'}")
-    print(f"[Saved] {out_dir / 'test_per_o_eval.csv'}")
-    print(f"[Saved] {out_dir / 'train_metrics.json'}")
-    print(f"[Saved] {ckpt_path}")
-
-
-def main() -> None:
-    args = parse_args()
-    apply_disable_losses(args)
-    set_seed(int(args.seed))
-    device = choose_device(args.device)
-
-    t_df, o_df, tt_edges_df, to_labels_df = validate_and_prepare_data(
-        args.t_csv,
-        args.o_csv,
-        args.tt_edges_csv,
-        args.to_labels_csv,
-    )
-    to_labels_train_df, to_labels_test_df, label_split_summary = split_to_labels(
-        to_labels_df=to_labels_df,
-        test_ratio=float(args.label_test_ratio),
-        seed=int(args.seed),
-        mode=str(args.label_split_mode),
-    )
-    print(
-        "[LabelSplit] "
-        f"mode={label_split_summary['label_split_mode']} "
-        f"train={label_split_summary['train_labels']} "
-        f"test={label_split_summary['test_labels']} "
-        f"actual_test_ratio={label_split_summary['label_test_ratio_actual']:.3f} "
-        f"train_pos={label_split_summary['train_pos_labels']} "
-        f"test_pos={label_split_summary['test_pos_labels']}"
-    )
-    embedder = SentenceTransformer(args.text_model, device=str(device))
-    artifacts = build_artifacts(
-        t_df=t_df,
-        o_df=o_df,
-        tt_edges_df=tt_edges_df,
-        to_labels_df=to_labels_train_df,
-        model=embedder,
-        args=args,
-        device=device,
-    )
-
-    model = SpatioSemanticGAT(
-        t_in_dim=int(artifacts.x_t.shape[1]),
-        o_in_dim=int(artifacts.x_o.shape[1]),
-        hidden_dim=int(args.hidden_dim),
-        num_layers=int(args.num_layers),
-        heads=int(args.heads),
-        dropout=float(args.dropout),
-        num_clusters=int(args.k),
-        cluster_temp=float(args.cluster_temp),
-        relation_edge_dims=artifacts.relation_edge_dims,
-    ).to(device)
-
-    run_shape_checks(model, artifacts)
-    model, history, best_epoch = train(model, artifacts, args, device)
-    export_results(
-        model=model,
-        artifacts=artifacts,
-        args=args,
-        out_dir=Path(args.out_dir),
-        ckpt_dir=Path(args.ckpt_dir),
-        best_epoch=best_epoch,
-        history=history,
-        train_labels_df=to_labels_train_df,
-        test_labels_df=to_labels_test_df,
-        label_split_summary=label_split_summary,
-    )
-    if int(args.smoke_epochs) > 0:
-        print("[Smoke] smoke training finished.")
-
-
-if __name__ == "__main__":
-    main()
+   
